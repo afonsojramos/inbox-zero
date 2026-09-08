@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createFolderPath } from "./folder-utils";
+import {
+  createFolderPath,
+  joinFolderPath,
+  resolveFolderPathTarget,
+} from "./folder-utils";
 import type { DriveProvider, DriveFolder } from "./types";
 import { createTestLogger } from "@/__tests__/helpers";
 
@@ -106,7 +110,137 @@ describe("createFolderPath", () => {
     expect(result.allFolders[0].path).toBe("Plans-2026");
     expect(provider.createFolder).not.toHaveBeenCalled();
   });
+
+  it("should create the path inside a parent folder and keep the full path", async () => {
+    const provider = createMockProvider();
+
+    const result = await createFolderPath(provider, "2026/Amazon", logger, {
+      id: "parent-1",
+      path: "Finance/Receipts",
+    });
+
+    expect(result.folder.name).toBe("Amazon");
+    expect(result.allFolders).toHaveLength(2);
+    expect(result.allFolders[0].path).toBe("Finance/Receipts/2026");
+    expect(result.allFolders[1].path).toBe("Finance/Receipts/2026/Amazon");
+    expect(provider.listFolders).toHaveBeenNthCalledWith(1, "parent-1");
+    expect(provider.createFolder).toHaveBeenNthCalledWith(
+      1,
+      "2026",
+      "parent-1",
+    );
+  });
+
+  it("should reuse an existing subfolder of the parent", async () => {
+    const existingFolders = new Map<string | undefined, DriveFolder[]>([
+      ["parent-1", [createMockFolder("existing-2026", "2026")]],
+    ]);
+    const provider = createMockProvider(existingFolders);
+
+    const result = await createFolderPath(provider, "2026/Amazon", logger, {
+      id: "parent-1",
+      path: "Receipts",
+    });
+
+    expect(result.allFolders[0].folder.id).toBe("existing-2026");
+    expect(result.allFolders[1].path).toBe("Receipts/2026/Amazon");
+    expect(provider.createFolder).toHaveBeenCalledTimes(1);
+    expect(provider.createFolder).toHaveBeenCalledWith(
+      "Amazon",
+      "existing-2026",
+    );
+  });
 });
+
+describe("resolveFolderPathTarget", () => {
+  const folders = [
+    knownFolder("receipts", "Receipts"),
+    knownFolder("receipts-2025", "Receipts/2025"),
+    knownFolder("legal", "Finance/Legal"),
+  ];
+
+  it("reuses a folder whose path matches exactly, ignoring case and slashes", () => {
+    const target = resolveFolderPathTarget({
+      folderPath: "/finance/legal/",
+      folders,
+    });
+
+    expect(target).toEqual({ kind: "existing", folder: folders[2] });
+  });
+
+  it("nests a new path under the deepest known folder that prefixes it", () => {
+    const target = resolveFolderPathTarget({
+      folderPath: "Receipts/2025/Amazon",
+      folders,
+    });
+
+    expect(target).toEqual({
+      kind: "create",
+      parent: folders[1],
+      relativePath: "Amazon",
+      fullPath: "Receipts/2025/Amazon",
+    });
+  });
+
+  it("nests several new levels under a known folder at once", () => {
+    const target = resolveFolderPathTarget({
+      folderPath: "receipts/2026/Amazon",
+      folders,
+    });
+
+    expect(target).toEqual({
+      kind: "create",
+      parent: folders[0],
+      relativePath: "2026/Amazon",
+      fullPath: "Receipts/2026/Amazon",
+    });
+  });
+
+  it("does not treat a partial name as a prefix", () => {
+    const target = resolveFolderPathTarget({
+      folderPath: "Receipts Archive/2026",
+      folders,
+    });
+
+    expect(target).toEqual({
+      kind: "create",
+      parent: null,
+      relativePath: "Receipts Archive/2026",
+      fullPath: "Receipts Archive/2026",
+    });
+  });
+
+  it("creates from the root when no known folder matches", () => {
+    const target = resolveFolderPathTarget({
+      folderPath: "Contracts",
+      folders,
+    });
+
+    expect(target).toEqual({
+      kind: "create",
+      parent: null,
+      relativePath: "Contracts",
+      fullPath: "Contracts",
+    });
+  });
+});
+
+describe("joinFolderPath", () => {
+  it("joins and normalizes both halves", () => {
+    expect(joinFolderPath("Finance/Receipts/", "/2026\\Amazon")).toBe(
+      "Finance/Receipts/2026/Amazon",
+    );
+  });
+});
+
+function knownFolder(id: string, path: string) {
+  return {
+    id,
+    name: path.split("/").at(-1) ?? path,
+    path,
+    driveConnectionId: "drive-1",
+  };
+}
 
 function createMockFolder(id: string, name: string): DriveFolder {
   return {

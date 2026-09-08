@@ -1,0 +1,157 @@
+name: "Fork: publish image"
+run-name: "Fork: publish image for ${{ inputs.ref || github.sha }}"
+
+# Builds the downstream Inbox Zero image from the `custom` branch and pushes it
+# to ghcr.io/<owner>/inbox-zero. afonsojramos/cloud pins one of the dated tags
+# in hetzner/stacks/inbox-zero/docker-compose.yml.
+#
+# Tags for every build:
+#   <YYYYMMDD>.<HHMMSS>  committer date (UTC) of the built commit; sortable, so
+#                        Renovate can offer newer builds to the cloud repo
+#   sha-<short sha>      exact commit
+#   custom               moving tag for the latest build of the branch
+
+on:
+  push:
+    branches: [custom]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "**/*.mdx"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit SHA to build (used by the upstream sync workflow)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fork-publish-image-${{ inputs.ref || github.sha }}
+  cancel-in-progress: false
+
+env:
+  BUILD_REF: ${{ inputs.ref || github.sha }}
+
+jobs:
+  verify:
+    name: "Run patch tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.BUILD_REF }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996 # v6
+
+      - name: Install dependencies
+        run: sh scripts/pnpm-install-without-desktop.sh --frozen-lockfile
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
+      - name: Lint the patched files
+        run: pnpm exec biome check apps/web/utils/drive apps/web/utils/ai/document-filing
+
+      - name: Run the tests that cover the fork patches
+        run: pnpm -F inbox-zero-ai exec vitest --run utils/drive utils/ai/document-filing
+        env:
+          RUN_AI_TESTS: "false"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/postgres"
+          AUTH_SECRET: "secret"
+          GOOGLE_CLIENT_ID: "client_id"
+          GOOGLE_CLIENT_SECRET: "client_secret"
+          MICROSOFT_CLIENT_ID: "client_id"
+          MICROSOFT_CLIENT_SECRET: "client_secret"
+          GOOGLE_PUBSUB_TOPIC_NAME: "topic"
+          EMAIL_ENCRYPT_SECRET: "secret"
+          EMAIL_ENCRYPT_SALT: "salt"
+          INTERNAL_API_KEY: "secret"
+          NEXT_PUBLIC_BASE_URL: "http://localhost:3000"
+
+  build:
+    name: "Build and push"
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.BUILD_REF }}
+
+      - name: Compute image tags
+        id: tags
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/inbox-zero
+        run: |
+          set -euo pipefail
+          dated="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d.%H%M%S HEAD)"
+          short="$(git rev-parse --short=7 HEAD)"
+          {
+            echo "dated=${dated}"
+            echo "short=${short}"
+            echo "tags<<EOF"
+            echo "${IMAGE}:${dated}"
+            echo "${IMAGE}:sha-${short}"
+            echo "${IMAGE}:custom"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing ${IMAGE}:${dated} (sha-${short})" >> "$GITHUB_STEP_SUMMARY"
+
+      # The Next.js production build inside Dockerfile.prod runs with an 8 GB
+      # V8 heap on top of pnpm's install and BuildKit's own usage. Upstream
+      # builds on Depot for that reason; on a standard 16 GB runner the first
+      # attempt here lost the runner mid-build. Reclaim the preinstalled
+      # toolchains for disk and add swap so a heap spike degrades to slow
+      # instead of killing the job.
+      - name: Free disk space and add swap
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile >/dev/null
+          sudo swapon /mnt/swapfile
+          free -h
+          df -h /
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      # The atlas server is x86 (cpx32), so a single-arch build is enough. No
+      # layer-cache export: exporting every intermediate layer to the Actions
+      # cache costs gigabytes of disk and minutes per run for a weekly build.
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: docker/Dockerfile.prod
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.BUILD_REF }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.dated }}
+            org.opencontainers.image.description=Inbox Zero with afonsojramos fork patches

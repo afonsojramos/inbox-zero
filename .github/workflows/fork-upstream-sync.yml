@@ -1,0 +1,188 @@
+name: "Fork: sync upstream"
+run-name: "Fork: sync upstream (${{ inputs.upstream_ref || 'main' }})"
+
+# Keeps this fork current with elie222/inbox-zero.
+#
+#   main    exact mirror of upstream main; never carries fork commits
+#   custom  upstream main + the fork patch series (`git log main..custom`)
+#
+# Each run mirrors upstream into `main`, rebases `custom` onto it, pushes the
+# rebased branch and publishes a new image. When the rebase conflicts nothing
+# is pushed; an issue lists the conflicting files and the commands to resolve
+# them locally. See FORK.md.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream ref to sync to"
+        required: false
+        default: "main"
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: elie222/inbox-zero
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+  MIRROR_BRANCH: main
+  PATCH_BRANCH: custom
+  CONFLICT_ISSUE_TITLE: "Upstream sync conflict: rebase custom onto upstream main"
+
+jobs:
+  sync:
+    name: "Mirror upstream and rebase custom"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      changed: ${{ steps.rebase.outputs.changed }}
+      sha: ${{ steps.rebase.outputs.sha }}
+    steps:
+      - name: Checkout custom
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Upstream ships scheduled workflows that need upstream secrets. Disabling
+      # them through the API avoids editing their files, which would conflict on
+      # every rebase. Idempotent; workflows that do not exist are ignored.
+      - name: Disable upstream scheduled workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          for wf in $(grep -l '^  schedule:\|^on:.*schedule' .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null || true); do
+            name="$(basename "$wf")"
+            case "$name" in fork-*) continue ;; esac
+            gh workflow disable "$name" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+              && echo "disabled $name" || echo "skip $name"
+          done
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_REF}"
+          echo "upstream ${UPSTREAM_REPO}@${UPSTREAM_REF} is $(git rev-parse --short FETCH_HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Mirror upstream into main
+        run: |
+          set -euo pipefail
+          git push --force origin "FETCH_HEAD:refs/heads/${MIRROR_BRANCH}"
+
+      - name: Rebase custom onto upstream
+        id: rebase
+        run: |
+          set -euo pipefail
+          before="$(git rev-parse HEAD)"
+          base="$(git rev-parse FETCH_HEAD)"
+
+          if git merge-base --is-ancestor "$base" HEAD; then
+            echo "custom already contains upstream ${base:0:7}; nothing to do" >> "$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "sha=$before" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git rebase "$base"; then
+            {
+              echo "conflicts<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+              echo "upstream=$base"
+              echo "before=$before"
+            } >> "$GITHUB_OUTPUT"
+            git rebase --abort
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "Rebase conflicted; see the issue for details" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          after="$(git rev-parse HEAD)"
+          git push --force-with-lease="${PATCH_BRANCH}:${before}" origin "HEAD:refs/heads/${PATCH_BRANCH}"
+          {
+            echo "Rebased custom: ${before:0:7} -> ${after:0:7}"
+            echo
+            echo "Patch series:"
+            git log --oneline "${base}..${after}" | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$after" >> "$GITHUB_OUTPUT"
+
+      - name: Report conflict
+        if: steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFLICTS: ${{ steps.rebase.outputs.conflicts }}
+          UPSTREAM_SHA: ${{ steps.rebase.outputs.upstream }}
+          BEFORE_SHA: ${{ steps.rebase.outputs.before }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          body="$(cat <<EOF
+          Rebasing \`${PATCH_BRANCH}\` (\`${BEFORE_SHA:0:7}\`) onto upstream \`${UPSTREAM_REF}\` (\`${UPSTREAM_SHA:0:7}\`) conflicted. Nothing was pushed; \`${PATCH_BRANCH}\` and the published image are unchanged.
+
+          Conflicting files:
+          \`\`\`
+          ${CONFLICTS}
+          \`\`\`
+
+          Resolve locally:
+          \`\`\`sh
+          git fetch origin ${PATCH_BRANCH} ${MIRROR_BRANCH}
+          git checkout -B ${PATCH_BRANCH} origin/${PATCH_BRANCH}
+          git rebase origin/${MIRROR_BRANCH}
+          # fix conflicts, git add, git rebase --continue
+          pnpm -F inbox-zero-ai exec vitest --run utils/drive utils/ai/document-filing
+          git push --force-with-lease origin ${PATCH_BRANCH}
+          \`\`\`
+
+          Pushing \`${PATCH_BRANCH}\` publishes a new image automatically. Run: ${RUN_URL}
+          EOF
+          )"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"${CONFLICT_ISSUE_TITLE}\" in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$CONFLICT_ISSUE_TITLE" --body "$body"
+          fi
+          exit 1
+
+      - name: Close stale conflict issue
+        if: steps.rebase.outputs.conflict != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"${CONFLICT_ISSUE_TITLE}\" in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$GITHUB_REPOSITORY" --comment "The rebase succeeded in a later run; closing."
+          fi
+
+  publish:
+    name: "Publish image"
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/fork-publish-image.yml
+    with:
+      ref: ${{ needs.sync.outputs.sha }}
